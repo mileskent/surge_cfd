@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 macroquad = "0.4"
-# ocl = "0.19"
+ocl = "0.19"

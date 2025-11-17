@@ -10,7 +10,7 @@ mod fluid; use fluid::*;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 800;
-const GRID_WIDTH: usize = 100;
+const GRID_WIDTH: usize = 200;
 const GRID_HEIGHT: usize = GRID_WIDTH;
 const GRID_SQUARE_WIDTH: u32 = WIDTH / GRID_WIDTH as u32;
 const GRID_SQUARE_HEIGHT: u32 = HEIGHT / GRID_HEIGHT as u32;
@@ -124,6 +124,17 @@ async fn main() {
 
         fluid.step();
         draw_frame(&fluid);
+
+        let fps = get_fps();
+        let fps_text = format!("FPS: {}", fps);
+        draw_text(
+            &fps_text,
+            10.0,            
+            30.0,            
+            30.0,            
+            BLACK,           
+        );
+
         next_frame().await;
     }
 }
