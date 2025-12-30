@@ -1,265 +1,135 @@
 use crate::DENSITY_DECAY;
-use ocl::{ProQue};
+use ocl::{ProQue, Buffer, MemFlags};
 use std::fs;
+
+pub fn ix(x: usize, y: usize, n: usize) -> usize {
+    x + y * (n + 2)
+}
 
 pub struct Fluid {
     n: usize,
     dt: f32,
     diffusion_rate: f32,
     viscocity: f32,
-    u: Vec<f32>,
-    v: Vec<f32>,
-    u_prev: Vec<f32>,
-    v_prev: Vec<f32>,
-    pub dens: Vec<f32>,
-    dens_prev: Vec<f32>,
-    pro_que: ProQue, 
-}
-
-pub fn ix(x: usize, y: usize, n: usize) -> usize {
-    x + y * (n + 2)
+    u: Buffer<f32>,
+    v: Buffer<f32>,
+    u_prev: Buffer<f32>,
+    v_prev: Buffer<f32>,
+    pub dens_host: Vec<f32>, 
+    dens: Buffer<f32>,
+    dens_prev: Buffer<f32>,
+    pro_que: ProQue,
 }
 
 impl Fluid {
     pub fn new(n: usize, diffusion_rate: f32, viscocity: f32, dt: f32) -> Self {
         let size = (n + 2) * (n + 2);
+        let kernel_src = fs::read_to_string("./kernels/lin_solve.cl").unwrap();
+        let pro_que = ProQue::builder().src(kernel_src).dims(n * n).build().unwrap();
 
-        // OpenCL
-        let kernel_src = fs::read_to_string("./kernels/lin_solve.cl")
-            .expect("Failed to read OpenCL kernel file at ./kernels/lin_solve.cl");
-
-        let dims = n * n;
-
-        let pro_que = ProQue::builder()
-            .src(kernel_src)
-            .dims(dims)
-            .build()
-            .expect("Failed to build OpenCL ProQue");
+        let create_buf = || Buffer::<f32>::builder()
+            .queue(pro_que.queue().clone())
+            .flags(MemFlags::new().read_write())
+            .len(size)
+            .fill_val(0.0)
+            .build().unwrap();
 
         Self {
-            n,
-            dt,
-            diffusion_rate,
-            viscocity,
-            u: vec![0.0; size],
-            v: vec![0.0; size],
-            u_prev: vec![0.0; size],
-            v_prev: vec![0.0; size],
-            dens: vec![0.0; size],
-            dens_prev: vec![0.0; size],
-            pro_que, 
+            n, dt, diffusion_rate, viscocity,
+            u: create_buf(), v: create_buf(),
+            u_prev: create_buf(), v_prev: create_buf(),
+            dens_host: vec![0.0; size],
+            dens: create_buf(), dens_prev: create_buf(),
+            pro_que,
         }
+    }
+
+    pub fn apply_mouse_force(&mut self, mx: usize, my: usize, brush_radius: f32, density: f32, fx: f32, fy: f32) {
+        let kernel = self.pro_que.kernel_builder("inject_fluid_kernel")
+            .arg(self.n as i32)
+            .arg(mx as i32)
+            .arg(my as i32)
+            .arg(brush_radius)
+            .arg(density)
+            .arg(fx)
+            .arg(fy)
+            .arg(&self.dens)
+            .arg(&self.u)
+            .arg(&self.v)
+            .build().unwrap();
+        
+        unsafe { kernel.enq().unwrap(); }
     }
 
     pub fn step(&mut self) {
         std::mem::swap(&mut self.u, &mut self.u_prev);
         std::mem::swap(&mut self.v, &mut self.v_prev);
-        Fluid::diffuse(&self.pro_que, self.n, self.dt, 1, &mut self.u, &self.u_prev, self.viscocity);
-        Fluid::diffuse(&self.pro_que, self.n, self.dt, 2, &mut self.v, &self.v_prev, self.viscocity);
-        Fluid::project(
-            &self.pro_que,
-            self.n,
-            &mut self.u,
-            &mut self.v,
-            &mut self.u_prev,
-            &mut self.v_prev,
-        );
+        self.diffuse(1, &self.u, &self.u_prev, self.viscocity);
+        self.diffuse(2, &self.v, &self.v_prev, self.viscocity);
+        self.project();
 
         std::mem::swap(&mut self.u, &mut self.u_prev);
         std::mem::swap(&mut self.v, &mut self.v_prev);
-        Fluid::advect(
-            self.n,
-            self.dt,
-            1,
-            &mut self.u,
-            &self.u_prev,
-            &self.u_prev,
-            &self.v_prev,
-        );
-        Fluid::advect(
-            self.n,
-            self.dt,
-            2,
-            &mut self.v,
-            &self.v_prev,
-            &self.u_prev,
-            &self.v_prev,
-        );
-        Fluid::project(
-            &self.pro_que, 
-            self.n,
-            &mut self.u,
-            &mut self.v,
-            &mut self.u_prev,
-            &mut self.v_prev,
-        );
+        self.advect(1, &self.u, &self.u_prev, &self.u_prev, &self.v_prev);
+        self.advect(2, &self.v, &self.v_prev, &self.u_prev, &self.v_prev);
+        self.project();
 
         std::mem::swap(&mut self.dens, &mut self.dens_prev);
-        Fluid::diffuse(&self.pro_que, self.n, self.dt, 0, &mut self.dens, &self.dens_prev, self.diffusion_rate);
+        self.diffuse(0, &self.dens, &self.dens_prev, self.diffusion_rate);
         std::mem::swap(&mut self.dens, &mut self.dens_prev);
-        Fluid::advect(
-            self.n,
-            self.dt,
-            0,
-            &mut self.dens,
-            &self.dens_prev,
-            &self.u,
-            &self.v,
-        );
+        self.advect(0, &self.dens, &self.dens_prev, &self.u, &self.v);
 
-        for i in 0..self.dens.len() {
-            self.dens[i] *= DENSITY_DECAY;
-        }
+        let size = (self.n + 2) * (self.n + 2);
+        let decay_k = self.pro_que.kernel_builder("decay_kernel")
+            .arg(size as i32).arg(&self.dens).arg(DENSITY_DECAY).global_work_size(size).build().unwrap();
+        unsafe { decay_k.enq().unwrap(); }
+
+        self.dens.read(&mut self.dens_host).enq().unwrap();
     }
 
-    pub fn add_density(&mut self, x: usize, y: usize, s: f32) {
-        self.dens[ix(x, y, self.n)] += s;
+    fn diffuse(&self, b: u32, x: &Buffer<f32>, x0: &Buffer<f32>, rate: f32) {
+        let a = self.dt * rate * (self.n as f32).powi(2);
+        self.lin_solve(b, x, x0, a, 1.0 + 4.0 * a);
     }
 
-    pub fn add_velocity(&mut self, x: usize, y: usize, amount_x: f32, amount_y: f32) {
-        let i = ix(x, y, self.n);
-        self.u[i] += amount_x;
-        self.v[i] += amount_y;
-    }
-
-    fn run_set_bounds_kernel(pro_que: &ProQue, n: usize, b: u32, buffer: &ocl::Buffer<f32>) {
-        let n_i32 = n as i32;
-        let size = (n + 2) * (n + 2);
-
-        let kernel = pro_que.kernel_builder("set_bounds_kernel")
-            .arg(n_i32)          
-            .arg(b as i32)       
-            .arg(buffer)         
-            .global_work_size(size) 
-            .build()
-            .unwrap();
-        
-        unsafe {
-            kernel.enq().unwrap();
-        }
-    }
-
-    fn set_bounds(n: usize, b: u32, x: &mut [f32]) {
-        for i in 1..=n {
-            x[ix(0, i, n)] = if b == 1 { -x[ix(1, i, n)] } else { x[ix(1, i, n)] };
-            x[ix(n + 1, i, n)] = if b == 1 { -x[ix(n, i, n)] } else { x[ix(n, i, n)] };
-            x[ix(i, 0, n)] = if b == 2 { -x[ix(i, 1, n)] } else { x[ix(i, 1, n)] };
-            x[ix(i, n + 1, n)] = if b == 2 { -x[ix(i, n, n)] } else { x[ix(i, n, n)] };
-        }
-
-        x[ix(0, 0, n)] = 0.5 * (x[ix(1, 0, n)] + x[ix(0, 1, n)]);
-        x[ix(0, n + 1, n)] = 0.5 * (x[ix(1, n + 1, n)] + x[ix(0, n, n)]);
-        x[ix(n + 1, 0, n)] = 0.5 * (x[ix(n, 0, n)] + x[ix(n + 1, 1, n)]);
-        x[ix(n + 1, n + 1, n)] = 0.5 * (x[ix(n, n + 1, n)] + x[ix(n + 1, n, n)]);
-    }
-
-    fn lin_solve(pro_que: &ProQue, n: usize, b: u32, x: &mut [f32], x0: &[f32], a: f32, c: f32) {
-        let n_i32 = n as i32;
-        let size = (n + 2) * (n + 2); 
-        let x_buffer = pro_que.buffer_builder::<f32>()
-            .len(size)
-            .copy_host_slice(x)
-            .build()
-            .unwrap();
-        let x0_buffer = pro_que.buffer_builder::<f32>()
-            .len(size)
-            .copy_host_slice(x0)
-            .build()
-            .unwrap();
-
+    fn lin_solve(&self, b: u32, x: &Buffer<f32>, x0: &Buffer<f32>, a: f32, c: f32) {
+        let kernel = self.pro_que.kernel_builder("lin_solve_iter")
+            .arg(self.n as i32).arg(x).arg(x0).arg(a).arg(c).build().unwrap();
         for _ in 0..20 {
-            let kernel = pro_que.kernel_builder("lin_solve_iter")
-                .arg(n_i32)
-                .arg(&x_buffer)
-                .arg(&x0_buffer)
-                .arg(a)
-                .arg(c)
-                .build()
-                .unwrap();
-
-            unsafe {
-                kernel.enq().unwrap();
-            }
-
-            Fluid::run_set_bounds_kernel(pro_que, n, b, &x_buffer);
+            unsafe { kernel.enq().unwrap(); }
+            self.set_bounds(b, x);
         }
+    }
 
-        x_buffer.read(&mut *x).enq().unwrap();
+    fn advect(&self, b: u32, d: &Buffer<f32>, d0: &Buffer<f32>, u: &Buffer<f32>, v: &Buffer<f32>) {
+        let kernel = self.pro_que.kernel_builder("advect_kernel")
+            .arg(self.n as i32).arg(self.dt).arg(d).arg(d0).arg(u).arg(v).build().unwrap();
+        unsafe { kernel.enq().unwrap(); }
+        self.set_bounds(b, d);
+    }
+
+    fn project(&mut self) {
+        let div = &self.u_prev;
+        let p = &self.v_prev;
         
-        Fluid::set_bounds(n, b, x);
+        let k1 = self.pro_que.kernel_builder("project_step1")
+            .arg(self.n as i32).arg(&self.u).arg(&self.v).arg(p).arg(div).build().unwrap();
+        unsafe { k1.enq().unwrap(); }
+        self.set_bounds(0, div);
+        self.set_bounds(0, p);
+
+        self.lin_solve(0, p, div, 1.0, 4.0);
+
+        let k2 = self.pro_que.kernel_builder("project_step2")
+            .arg(self.n as i32).arg(&self.u).arg(&self.v).arg(p).build().unwrap();
+        unsafe { k2.enq().unwrap(); }
+        self.set_bounds(1, &self.u);
+        self.set_bounds(2, &self.v);
     }
 
-
-    fn diffuse(pro_que: &ProQue, n: usize, dt: f32, b: u32, x: &mut [f32], x0: &[f32], diffusion_rate: f32) {
-        let a = dt * diffusion_rate * n as f32 * n as f32;
-        let c: f32 = 1.0 + 4.0 * a;
-        Fluid::lin_solve(pro_que, n, b, x, x0, a, c);
-    }
-
-    fn advect(n: usize, dt: f32, b: u32, d: &mut [f32], d0: &[f32], u: &[f32], v: &[f32]) {
-        let dt0 = dt * n as f32;
-        for j in 1..=n {
-            for i in 1..=n {
-                let mut x = i as f32 - dt0 * u[ix(i, j, n)];
-                let mut y = j as f32 - dt0 * v[ix(i, j, n)];
-
-                if x < 0.5 {
-                    x = 0.5;
-                }
-                if x > n as f32 + 0.5 {
-                    x = n as f32 + 0.5;
-                }
-                let i0 = x.floor() as usize;
-                let i1 = i0 + 1;
-
-                if y < 0.5 {
-                    y = 0.5;
-                }
-                if y > n as f32 + 0.5 {
-                    y = n as f32 + 0.5;
-                }
-                let j0 = y.floor() as usize;
-                let j1 = j0 + 1;
-
-                let s1 = x - i0 as f32;
-                let s0 = 1.0 - s1;
-                let t1 = y - j0 as f32;
-                let t0 = 1.0 - t1;
-
-                d[ix(i, j, n)] = s0 * (t0 * d0[ix(i0, j0, n)] + t1 * d0[ix(i0, j1, n)])
-                    + s1 * (t0 * d0[ix(i1, j0, n)] + t1 * d0[ix(i1, j1, n)]);
-            }
-        }
-        Fluid::set_bounds(n, b, d);
-    }
-
-    fn project(pro_que: &ProQue, n: usize, u: &mut [f32], v: &mut [f32], p: &mut [f32], div: &mut [f32]) {
-        let h = 1.0 / n as f32;
-
-        for j in 1..=n {
-            for i in 1..=n {
-                div[ix(i, j, n)] = -0.5
-                    * h
-                    * (u[ix(i + 1, j, n)] - u[ix(i - 1, j, n)]
-                        + v[ix(i, j + 1, n)] - v[ix(i, j - 1, n)]);
-                p[ix(i, j, n)] = 0.0;
-            }
-        }
-
-        Fluid::set_bounds(n, 0, div);
-        Fluid::set_bounds(n, 0, p);
-        
-        // Use the GPU-accelerated solver
-        Fluid::lin_solve(pro_que, n, 0, p, div, 1.0, 4.0);
-
-        for j in 1..=n {
-            for i in 1..=n {
-                u[ix(i, j, n)] -= 0.5 * (p[ix(i + 1, j, n)] - p[ix(i - 1, j, n)]) / h;
-                v[ix(i, j, n)] -= 0.5 * (p[ix(i, j + 1, n)] - p[ix(i, j - 1, n)]) / h;
-            }
-        }
-
-        Fluid::set_bounds(n, 1, u);
-        Fluid::set_bounds(n, 2, v);
+    fn set_bounds(&self, b: u32, x: &Buffer<f32>) {
+        let k = self.pro_que.kernel_builder("set_bounds_kernel")
+            .arg(self.n as i32).arg(b as i32).arg(x).global_work_size(self.n).build().unwrap();
+        unsafe { k.enq().unwrap(); }
     }
 }
